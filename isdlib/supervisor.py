@@ -1,6 +1,7 @@
 """One disposable supervisor per display; no system-wide daemon."""
 
 import ctypes
+from itertools import islice
 import json
 import os
 from pathlib import Path
@@ -17,7 +18,6 @@ from .core import (
     Error,
     PROTOCOL,
     atomic_json,
-    clean_env,
     descendants,
     matches,
     process,
@@ -25,6 +25,7 @@ from .core import (
     signal_owned,
     xenv,
 )
+from .display import ALLOCATION, display_candidates, filesystem_occupied, xvfb_command
 
 
 class Supervisor:
@@ -40,6 +41,7 @@ class Supervisor:
             "owned": [],
             "size": [width, height],
             "display": None,
+            "display_allocation": ALLOCATION,
             "app_exit": None,
             "error": None,
         }
@@ -117,50 +119,23 @@ class Supervisor:
             + field(b"MIT-MAGIC-COOKIE-1")
             + field(cookie)
         )
-        rfd, wfd = os.pipe()
-        try:
-            with (self.base / "xvfb.log").open("ab", buffering=0) as log:
-                self.xvfb = subprocess.Popen(
-                    [
-                        "Xvfb",
-                        "-displayfd",
-                        str(wfd),
-                        "-screen",
-                        "0",
-                        f"{self.state['size'][0]}x{self.state['size'][1]}x24",
-                        "-nolisten",
-                        "tcp",
-                        "-auth",
-                        str(server_auth),
-                        "-noreset",
-                    ],
-                    env=clean_env(os.environ),
-                    stdin=subprocess.DEVNULL,
-                    stdout=log,
-                    stderr=log,
-                    pass_fds=(wfd,),
-                    start_new_session=True,
-                )
-            self.state["xvfb"] = process(self.xvfb.pid, include_zombie=True)
-            self.save()
-        except BaseException:
-            os.close(rfd)
-            raise
-        finally:
-            os.close(wfd)
-        try:
-            deadline = time.monotonic() + 15
-            while not select.select([rfd], [], [], 0.1)[0]:
-                if self.stopping:
-                    raise Error("Xvfb startup interrupted")
-                if time.monotonic() >= deadline:
-                    raise Error("Xvfb readiness timeout")
-            number = os.read(rfd, 64).decode().strip()
-            if not number.isdecimal() or self.xvfb.poll() is not None:
-                raise Error("Xvfb failed to allocate a display; see xvfb.log")
-        finally:
-            os.close(rfd)
-        self.state["display"] = ":" + number
+        # The filesystem transport MUST be disabled before Xvfb starts. A
+        # preflight check alone cannot prevent Xtrans's unlink-before-bind race.
+        for number in islice(display_candidates(), 16):
+            if self.stopping:
+                raise Error("Xvfb startup interrupted")
+            if self.start_xvfb_candidate(number, server_auth):
+                # This second check only prevents ambiguous display names; it
+                # is not the socket-preservation mechanism. No foreign pathname
+                # could have been touched even if one appeared during startup.
+                if filesystem_occupied(number):
+                    raise Error("X11 filesystem endpoint appeared during allocation")
+                break
+        else:
+            raise Error("Xvfb failed to allocate a display; see xvfb.log")
+        if self.xvfb is None or self.xvfb.poll() is not None:
+            raise Error("Xvfb failed to allocate a display; see xvfb.log")
+        self.state["display"] = ":" + str(number)
         # Client entry matches the actual allocated display; same preloaded cookie.
         auth = self.base / "Xauthority"
         auth.touch(mode=0o600)
@@ -178,6 +153,55 @@ class Supervisor:
             raise Error("GL probe did not report an OpenGL version; see glxinfo.log")
         self.state["phase"] = "ready"
         self.save()
+
+    def start_xvfb_candidate(self, number, server_auth):
+        rfd, wfd = os.pipe()
+        try:
+            with (self.base / "xvfb.log").open("ab", buffering=0) as log:
+                self.xvfb = subprocess.Popen(
+                    xvfb_command(number, wfd, self.state["size"], server_auth),
+                    env=xenv(os.environ, self.base, f":{number}"),
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=log,
+                    pass_fds=(wfd,),
+                    start_new_session=True,
+                )
+            self.state["xvfb"] = process(self.xvfb.pid, include_zombie=True)
+            self.save()
+        except BaseException:
+            os.close(rfd)
+            raise
+        finally:
+            os.close(wfd)
+        try:
+            deadline = time.monotonic() + 15
+            response = b""
+            while b"\n" not in response:
+                if self.stopping:
+                    raise Error("Xvfb startup interrupted")
+                if time.monotonic() >= deadline:
+                    raise Error("Xvfb readiness timeout")
+                if not select.select([rfd], [], [], 0.1)[0]:
+                    continue
+                chunk = os.read(rfd, 64)
+                if not chunk:
+                    # Atomic abstract bind can lose a race to another server.
+                    # Retry only after this child is dead, never leave a live
+                    # failed attempt behind or signal by display number.
+                    try:
+                        self.xvfb.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        raise Error("Xvfb closed readiness pipe but is still alive")
+                    return False
+                response += chunk
+                if len(response) > 64:
+                    raise Error("Invalid Xvfb readiness response")
+            if response != f"{number}\n".encode() or self.xvfb.poll() is not None:
+                raise Error("Invalid Xvfb readiness response")
+            return True
+        finally:
+            os.close(rfd)
 
     def refresh(self, persist=True):
         if self.app is not None:

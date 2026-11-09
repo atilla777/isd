@@ -87,6 +87,7 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(private_dir(base), base)
             unsafe = base / "unsafe"
             unsafe.mkdir(mode=0o755)
+            unsafe.chmod(0o755)  # Exercise unsafe permissions even under umask 077.
             with self.assertRaises(Error):
                 private_dir(unsafe)
             link = base / "link"

@@ -19,6 +19,14 @@ the CLI resolves before talking to the supervisor.
   strings, on-disk state, Unix sockets, process inventories, and private helpers
   are not stable interfaces. No third-party Python API is promised.
 
+Successful `create` and subsequent `status` may additionally report
+`display_allocation: "linux-abstract-v1"`. This identifies the abstract-only
+allocation policy in the running supervisor, not a Git revision or application
+readiness. Consumers requiring this protection must reject a missing/unknown
+value before launching their app. Older environments do not gain this policy
+by updating the CLI on disk: stop them through their recorded CLI/root/ID and
+create new ones. See [copy verification](x11-allocation.md#consumer-copy-verification).
+
 ## Commands
 
 | Invocation | Stable result fields beyond `ok`, `protocol`, `id` |
