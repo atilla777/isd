@@ -62,11 +62,20 @@ def parser():
     focus = commands.add_parser("focus")
     focus.add_argument("id")
     focus.add_argument("--window", required=True)
+    layout = commands.add_parser(
+        "layout", help="set the isolated X11 keyboard layout: layout ID (ru|us)"
+    )
+    layout.add_argument("id")
+    layout.add_argument("layout", choices=("ru", "us"))
     key = commands.add_parser("key")
     key.add_argument("id")
     key.add_argument("action", choices=("down", "up", "tap", "hold"))
     key.add_argument("value")
     key.add_argument("--seconds", type=float)
+    keycode = commands.add_parser("keycode", help="send a physical X11 keycode")
+    keycode.add_argument("id")
+    keycode.add_argument("action", choices=("tap",))
+    keycode.add_argument("value", type=int)
     mouse = commands.add_parser("mouse")
     mouse.add_argument("id")
     mouse.add_argument("action", choices=("move", "down", "up", "click", "hold"))
@@ -263,14 +272,22 @@ def run(args, app_argv):
             pass
         elif args.op == "focus":
             payload.update(op="input", kind="focus", action="focus", window=args.window)
-        elif args.op in ("key", "mouse"):
+        elif args.op == "layout":
+            payload.update(layout=args.layout)
+        elif args.op in ("key", "keycode", "mouse"):
             if args.action == "hold" and args.seconds is None:
                 raise Error("hold requires --seconds")
+            kind = "key" if args.op == "keycode" else args.op
             payload.update(
-                op="input", kind=args.op, action=args.action, seconds=args.seconds
+                op="input",
+                kind=kind,
+                action=args.action,
+                seconds=getattr(args, "seconds", None),
             )
             if args.op == "key":
                 payload["value"] = args.value
+            elif args.op == "keycode":
+                payload.update(keycode=True, value=args.value)
             else:
                 if args.action == "move":
                     if len(args.values) != 2:

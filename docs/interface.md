@@ -19,6 +19,14 @@ the CLI resolves before talking to the supervisor.
   strings, on-disk state, Unix sockets, process inventories, and private helpers
   are not stable interfaces. No third-party Python API is promised.
 
+Successful `create` and subsequent `status` may additionally report
+`display_allocation: "linux-abstract-v1"`. This identifies the abstract-only
+allocation policy in the running supervisor, not a Git revision or application
+readiness. Consumers requiring this protection must reject a missing/unknown
+value before launching their app. Older environments do not gain this policy
+by updating the CLI on disk: stop them through their recorded CLI/root/ID and
+create new ones. See [copy verification](x11-allocation.md#consumer-copy-verification).
+
 ## Commands
 
 | Invocation | Stable result fields beyond `ok`, `protocol`, `id` |
@@ -29,6 +37,8 @@ the CLI resolves before talking to the supervisor.
 | `windows ID` | `windows: [{id: integer, name: string}, ...]` |
 | `screenshot ID (--screen \| --window WID) --output FILE` | `output` (absolute), `size: [w,h]`, `coordinates: "X11 pixels"` |
 | `focus ID --window WID` | `delivered: true`, `application_action_verified: false` |
+| `layout ID (ru\|us)` | `layout` (selected isolated X11 keyboard layout) |
+| `keycode ID tap KEYCODE` | same input result as `key` |
 | `key ID (down\|up\|tap) KEYSYM_OR_CHORD` | same input result |
 | `key ID hold KEYSYM_OR_CHORD --seconds N` | same input result |
 | `mouse ID move X Y [--window WID]` | same input result |
@@ -71,6 +81,18 @@ artifacts. `purge` requires stopped state and no live recorded identities, and
 removes only that environment's directory, not arbitrary screenshot outputs.
 After supervisor SIGKILL, unrecorded descendants may remain despite successful
 recorded-identity recovery; wrappers must surface that warning.
+
+`layout ID ru` opts that environment into the Russian XKB keyboard layout;
+`layout ID us` selects US English. This changes only the selected isolated Xvfb
+server, not the desktop or other ISD environments. The layout operation must be
+performed before sending keys whose meaning depends on it. The command reports
+the configured layout, not application text or behavior; callers still verify
+their own SDL/application result. `setxkbmap` must be available on the host.
+`keycode ID tap N` sends one XTEST press/release for a physical X11 keycode
+(8–255, further constrained by the selected server). Unlike `key`, it does not
+resolve a keysym; this lets a wrapper choose a physical position under the
+selected layout. Successful delivery does not verify the resulting keysym or
+application text.
 
 Same-ID calls are serialized, including synchronous holds and stop/purge.
 Different IDs remain independent. Client cancellation does not generally cancel

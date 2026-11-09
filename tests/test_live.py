@@ -75,6 +75,10 @@ class LiveTests(unittest.TestCase):
     def create(self, env=None):
         data = self.cli("create", "--size", "640x480", env=env)
         self.ids.append(data["id"])
+        self.assertEqual(data.get("display_allocation"), "linux-abstract-v1")
+        self.assertEqual(
+            self.status(data["id"]).get("display_allocation"), "linux-abstract-v1"
+        )
         return data["id"]
 
     def base(self, ident):
@@ -185,6 +189,34 @@ class LiveTests(unittest.TestCase):
             ok=False,
         )
 
+    def test_opt_in_keyboard_layout_is_private_to_isolated_display(self):
+        ident = self.create()
+        other = self.create()
+        self.cli("layout", ident, "ru")
+        query = self.tool(ident, "setxkbmap", "-query")
+        self.assertIn(
+            "ru",
+            next(line for line in query.splitlines() if line.startswith("layout:")),
+        )
+        other_query = self.tool(other, "setxkbmap", "-query")
+        self.assertIn(
+            "us",
+            next(
+                line for line in other_query.splitlines() if line.startswith("layout:")
+            ),
+        )
+        window = self.launch_fixture(ident)
+        self.cli("focus", ident, "--window", window)
+        self.cli("keycode", ident, "tap", "38")
+        self.wait(lambda: self.log_contains(ident, "key-down="))
+        self.assertNotIn("key-down=97", (self.base(ident) / "app.log").read_text())
+        self.cli("layout", ident, "us")
+        query = self.tool(ident, "setxkbmap", "-query")
+        self.assertIn(
+            "us",
+            next(line for line in query.splitlines() if line.startswith("layout:")),
+        )
+
     def test_authorization_and_tcp_disabled(self):
         fakebin = self.artifacts / "xauth-probe"
         fakebin.mkdir()
@@ -208,16 +240,40 @@ class LiveTests(unittest.TestCase):
             (base / "server.auth").read_bytes()[-16:].hex(), recorded.read_text()
         )
         env = xenv(os.environ, base, state["display"])
+        xcb_probe = (
+            "import ctypes,sys; x=ctypes.CDLL('libxcb.so.1'); "
+            "x.xcb_connect.argtypes=[ctypes.c_char_p,ctypes.c_void_p]; "
+            "x.xcb_connect.restype=ctypes.c_void_p; "
+            "x.xcb_connection_has_error.argtypes=[ctypes.c_void_p]; "
+            "x.xcb_disconnect.argtypes=[ctypes.c_void_p]; "
+            "c=x.xcb_connect(sys.argv[1].encode(),None); "
+            "e=x.xcb_connection_has_error(c); x.xcb_disconnect(c); sys.exit(bool(e))"
+        )
+        self.tool(ident, sys.executable, "-c", xcb_probe, state["display"], env=env)
         env["XAUTHORITY"] = str(base / "nonexistent-auth")
         self.tool(ident, "xdotool", "getdisplaygeometry", env=env, ok=False)
+        self.tool(
+            ident, sys.executable, "-c", xcb_probe, state["display"], env=env, ok=False
+        )
         other = self.create()
         env["XAUTHORITY"] = str(self.base(other) / "Xauthority")
         self.tool(ident, "xdotool", "getdisplaygeometry", env=env, ok=False)
+        self.tool(
+            ident, sys.executable, "-c", xcb_probe, state["display"], env=env, ok=False
+        )
         argv = Path(f"/proc/{state['xvfb']['pid']}/cmdline").read_bytes().split(b"\0")
         self.assertIn(b"-displayfd", argv)
         self.assertNotIn(b"-ac", argv)
         index = argv.index(b"-nolisten")
         self.assertEqual(argv[index + 1], b"tcp")
+        self.assertIn(b"-nopn", argv)
+        unix_index = argv.index(b"unix")
+        self.assertEqual(
+            argv[unix_index - 1 : unix_index + 3],
+            [b"-nolisten", b"unix", b"-listen", b"local"],
+        )
+        self.assertFalse(Path("/tmp/.X11-unix/X" + state["display"][1:]).exists())
+        self.assertFalse(Path("/tmp/.X" + state["display"][1:] + "-lock").exists())
         inodes = set()
         for fd in Path(f"/proc/{state['xvfb']['pid']}/fd").iterdir():
             try:
@@ -230,10 +286,41 @@ class LiveTests(unittest.TestCase):
             for line in Path(f"/proc/net/{name}").read_text().splitlines()[1:]:
                 fields = line.split()
                 self.assertFalse(fields[3] == "0A" and fields[9] in inodes)
+        listeners = []
+        for line in Path("/proc/net/unix").read_text().splitlines()[1:]:
+            fields = line.split()
+            if fields[6] in inodes and fields[3] == "00010000":
+                listeners.append(fields[7:])
+        self.assertEqual(listeners, [["@/tmp/.X11-unix/X" + state["display"][1:]]])
         for path in (base, base / "runtime"):
             self.assertEqual(path.stat().st_mode & 0o777, 0o700)
         for path in (base / "Xauthority", base / "server.auth", base / "state.json"):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_repeated_parallel_cycles_and_cleanup(self):
+        for cycle in range(3):
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                ids = list(pool.map(lambda _: self.create(), range(3)))
+            self.assertEqual(len({self.status(i)["display"] for i in ids}), 3)
+            for ident in ids:
+                self.assertEqual(
+                    self.tool(ident, "xdotool", "getdisplaygeometry"), "640 480"
+                )
+            window = self.launch_fixture(ids[2])
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                list(pool.map(lambda i: self.cli("stop", i), ids[:2]))
+            self.assertTrue(self.status(ids[2])["app_alive"])
+            self.shot(ids[2], f"cycle-{cycle}-peer-survives", window)
+            self.cli("stop", ids[2])
+            for ident in ids:
+                state = read_state(self.base(ident))
+                for item in [
+                    state["supervisor"],
+                    state["xvfb"],
+                    state["app"],
+                    *state["owned"],
+                ]:
+                    self.assertFalse(matches(item))
 
     def test_environment_argv_exit_and_missing_command(self):
         env = dict(

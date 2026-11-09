@@ -1,5 +1,22 @@
 # ISD — Isolated Display
 
+Local Slyx G09 verification candidate (not published): this worktree composes
+the existing safe X11 allocation implementation from `/home/aleksei/plums/isd`
+with the documented layout/keycode extension from `isd-ru-input`, both based
+on `c4cf1cfe61adee2050c458aa891b21e8cf43dc8b`. Use this exact checkout explicitly;
+the base commit alone does not identify the composed tool. Public optional
+`layout ID ru|us` and `keycode ID tap N` are specified in `docs/interface.md`.
+Neither operation uses the main desktop; no global install/config change is needed.
+
+The bounded compatibility repair also reports `display_allocation:
+"linux-abstract-v1"` from the running supervisor, matching upstream allocation
+policy at `d67f4e5cd81f6253a83a0be0810c66e843748fe9`. The already present allocator
+disables pathname transport before spawn, uses atomic abstract binding, bounded
+collision retries and exact readiness checks. A marker alone is not protection:
+verify the complete checkout and create/status responses before app launch.
+Stop and recreate old environments; their supervisor does not change on disk update.
+This candidate remains uncommitted/unpublished pending independent review.
+
 A small Linux CLI for running graphical applications on independent Xvfb
 displays. Agents can capture real pixels and send input without using the focus
 or input devices of the main desktop. Application language does not matter.
@@ -12,7 +29,8 @@ there is no window manager, viewer, system service, or game-testing framework.
 
 - Linux with `/proc`, `pidfd_open`/`pidfd_send_signal`, and subreaper support;
   Python 3.9+ with those APIs enabled.
-- `Xvfb` with `-displayfd` and GLX; `xauth`, `xdotool` (XTEST), `glxinfo`
+- Linux `Xvfb` with `-displayfd`, abstract AF_UNIX transport and GLX;
+  `xauth`, `xdotool` (XTEST), `glxinfo`
   (Mesa utilities), ImageMagick's `import`, and Python Pillow.
 - For the live tests only: a C compiler and Xlib headers/library (`cc -lX11`).
 
@@ -108,8 +126,11 @@ Default state: `~/.local/state/isd/ID/`, mode 0700. Each environment contains:
 Override storage with **`--root /absolute/private/path` before the subcommand**.
 Use the same root in all calls. ISD creates it mode 0700, rejects unsafe existing
 permissions and symlink paths, and requires a short enough Unix-socket pathname.
-Different agents can use one root or separate roots. UUID identifiers and Xvfb's
-atomic `-displayfd` allocation allow concurrent creates without reserved numbers.
+Different agents can use one root or separate roots. UUID identifiers and atomic
+abstract-socket binding allow concurrent creates without reserved numbers.
+ISD dynamically selects candidates, skips existing filesystem sockets/locks,
+and retries failed startup candidates (at most 16). `-displayfd` reports readiness
+for the selected candidate; it no longer scans shared filesystem socket names.
 Operations for the same ID are serialized; different IDs operate independently.
 A hold is synchronous (0–60 seconds), blocking other operations on that ID.
 
@@ -145,6 +166,16 @@ UI-tree or game-tick synchronization guarantees.
   xauth over stdin, not exposed in process arguments. TCP listening is
   disabled. Missing/wrong authority is tested to fail, including another ISD
   environment's cookie.
+- Xvfb uses **only Linux abstract AF_UNIX sockets**: `-nolisten unix` followed
+  by `-listen local`, plus `-nolisten tcp -nopn`. It never enters Xtrans's
+  filesystem unlink-before-bind path. Preflight checks alone would not be safe.
+  Normal `DISPLAY=:N` Xlib/XCB clients are supported; clients requiring a
+  filesystem X11 socket or a different network namespace are not supported.
+  See [the allocation investigation](docs/x11-allocation.md).
+- Successful `create`/`status` reports `display_allocation: "linux-abstract-v1"`.
+  Verify this in the running environment, not just `--version` or Git HEAD:
+  older worktrees at the same revision can still have the unsafe allocator.
+  See [consumer copy verification](docs/x11-allocation.md#consumer-copy-verification).
 - All X11 helpers receive the selected display and authority explicitly. No
   operation changes desktop settings, global environment, systemd, or D-Bus.
   Child descriptors are closed except Xvfb's explicit startup pipe.
@@ -161,9 +192,9 @@ UI-tree or game-tick synchronization guarantees.
 - `purge` checks stopped state and recorded identities; it cannot prove absence
   of unrecorded descendants after a supervisor SIGKILL. Recovery warnings are
   intentionally retained. Shared `/tmp/.X*-lock` and `/tmp/.X11-unix/X*` names
-  are not manually unlinked: after Xvfb SIGKILL they can be stale, or may already
-  belong to a new server. Xvfb handles its normal shutdown and stale startup
-  detection. This avoids deleting another server's socket by display number.
+  are not manually unlinked, including artifacts left by older ISD versions.
+  Current ISD creates neither shared filesystem sockets nor X11 lock files;
+  abstract bindings disappear when the last owning descriptor closes.
 - This is **not** a defense against a malicious same-UID process. An application
   can explicitly connect elsewhere, access devices, discover the user's session,
   or modify your files. No filesystem, network, audio, GPU-device, or resource
@@ -207,6 +238,7 @@ Internal state and socket protocol are implementation details, not wrapper APIs.
 
 ```sh
 python3 -m unittest tests.test_core -v  # process identity, paths, protocol, env
+python3 -m unittest tests.test_display tests.test_sandbox -v  # safe allocation regression
 python3 -m unittest tests.test_live -v  # real Xvfb + compiled independent Xlib fixture
 # or both:
 python3 -m unittest discover -s tests -v
@@ -221,6 +253,13 @@ focus. Open the emitted `*-02-screen.png`, `*-03-keyboard.png`, and `*-03-mouse.
 to visually verify the blue initial window, green keyboard response, and red
 mouse response. Automated assertions also check actual decoded pixel values and
 fixture event logs.
+
+The sandbox regression uses existing `unshare`/`mount` utilities and unprivileged
+user namespaces (otherwise explicitly skips). It verifies separate mount AND
+network namespaces, makes mounts private, and replaces `/tmp` before reproducing
+the old destructive allocation against a disposable foreign server. Its artifacts
+remain in `/tmp/opencode/isd-sandbox-*/tmp/opencode/`. Never run that reproduction
+on the host's shared X11 namespace. No new runtime dependency is introduced.
 
 For manual use of the same fixture, compile outside the checkout and launch it
 using the commands above:
